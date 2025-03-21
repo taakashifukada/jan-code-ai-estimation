@@ -29,6 +29,7 @@ class ProductInfo(BaseModel):
     makerName: Optional[str] = None
     makerNameKana: Optional[str] = None
     ProductDetails: Optional[Any] = None  # リストまたは辞書型を受け入れる
+    searchKeyword: Optional[str] = None  # この商品情報を取得するために使用した検索キーワード
 
 class JANCodeResponse(BaseModel):
     """JANコード推定レスポンスモデル"""
@@ -37,6 +38,8 @@ class JANCodeResponse(BaseModel):
     confidence: float = 0.0
     product_name: Optional[str] = None
     message: str = ""
+    usedKeywords: List[str] = []  # 検索に使用したキーワードのリスト
+    keywordHits: Dict[str, int] = {}  # 各キーワードに対するヒット数
 
 @router.post("/estimate-jancode", response_model=JANCodeResponse)
 async def estimate_jancode(request: JANCodeRequest):
@@ -75,6 +78,9 @@ async def estimate_jancode(request: JANCodeRequest):
         
         # ステップ2: 各キーワードでJANCODE LOOKUP APIを呼び出し
         all_products = []
+        keyword_hits = {}  # 各キーワードに対するヒット数
+        keyword_product_map = {}  # 各商品がどのキーワードで見つかったかを記録
+        
         for keyword in search_keywords:
             try:
                 search_result = await jancode_service.search_by_keyword(
@@ -83,12 +89,25 @@ async def estimate_jancode(request: JANCodeRequest):
                     page=1
                 )
                 
+                # ヒット数を記録
+                hit_count = search_result.get("info", {}).get("count", 0)
+                keyword_hits[keyword] = hit_count
+                
                 # 検索結果から商品情報を取得
                 products = search_result.get("product", [])
                 if products:
+                    # 各商品に検索キーワードを記録
+                    for product in products:
+                        code_number = product.get("codeNumber")
+                        if code_number:
+                            if code_number not in keyword_product_map:
+                                keyword_product_map[code_number] = []
+                            keyword_product_map[code_number].append(keyword)
+                    
                     all_products.extend(products)
             except Exception as e:
                 # 検索エラーは無視して次のキーワードに進む
+                keyword_hits[keyword] = 0
                 continue
         
         # 重複するJANコードを削除
@@ -96,6 +115,9 @@ async def estimate_jancode(request: JANCodeRequest):
         for product in all_products:
             code_number = product.get("codeNumber")
             if code_number and code_number not in unique_products:
+                # 商品情報に検索キーワードを追加
+                if code_number in keyword_product_map:
+                    product["searchKeyword"] = ", ".join(keyword_product_map[code_number])
                 unique_products[code_number] = product
         
         # 候補がない場合
@@ -129,7 +151,9 @@ async def estimate_jancode(request: JANCodeRequest):
                 candidates=candidate_products,
                 confidence=0.3,  # 低い確信度
                 product_name=product_name,
-                message="JANコード候補を推定しましたが、確度は低いです。JANCODE LOOKUP APIで商品情報が見つかりませんでした。"
+                message="JANコード候補を推定しましたが、確度は低いです。JANCODE LOOKUP APIで商品情報が見つかりませんでした。",
+                usedKeywords=search_keywords,
+                keywordHits=keyword_hits
             )
         
         # ステップ3: 得られたJANコード候補を再度OpenAI APIで絞り込み
@@ -193,7 +217,8 @@ async def estimate_jancode(request: JANCodeRequest):
                     brandName=product.get("brandName"),
                     makerName=product.get("makerName"),
                     makerNameKana=product.get("makerNameKana"),
-                    ProductDetails=product.get("ProductDetails", [])
+                    ProductDetails=product.get("ProductDetails", []),
+                    searchKeyword=product.get("searchKeyword")
                 )
             )
         
@@ -205,7 +230,9 @@ async def estimate_jancode(request: JANCodeRequest):
                 candidates=candidate_product_models,
                 confidence=confidence,
                 product_name=product_info.get("itemName", product_name),
-                message="JANコードが正常に推定されました。"
+                message="JANコードが正常に推定されました。",
+                usedKeywords=search_keywords,
+                keywordHits=keyword_hits
             )
         
         # 商品情報が見つからなかった場合
@@ -213,7 +240,9 @@ async def estimate_jancode(request: JANCodeRequest):
             candidates=candidate_product_models,
             confidence=0.7,  # 中程度の確信度
             product_name=product_name,
-            message="複数のJANコード候補が見つかりました。最も可能性の高い候補から順に表示しています。"
+            message="複数のJANコード候補が見つかりました。最も可能性の高い候補から順に表示しています。",
+            usedKeywords=search_keywords,
+            keywordHits=keyword_hits
         )
         
     except Exception as e:
